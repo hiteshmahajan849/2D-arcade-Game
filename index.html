@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starfall Drift</title>
+<style>
+  body{margin:0;background:#02020a;display:flex;justify-content:center;align-items:center;min-height:100vh}
+  canvas{max-width:100%;border-radius:6px;box-shadow:0 0 60px #6a3dff55;cursor:none}
+</style>
+</head>
+<body>
+<canvas id="game" width="900" height="620"></canvas>
+<script>
+/* ============ CUSTOMIZATION (edit this block for your assigned twist) ============ */
+const CONFIG = {
+  title: "STARFALL DRIFT",
+  shipColor: "#59f3ff",
+  crystalPoints: 10,
+  startLives: 3,
+  hitPenalty: 20,
+  maxMultiplier: 5,           // combo: +1 multiplier every 5 crystals in a row
+  levelEvery: 150,
+  speedPerLevel: 0.14,
+  hazardPerLevel: 0.035,
+  specialType: "magnet",      // "magnet" | "shield" | "slowmo"
+  specialDuration: 6
+};
+/* ================================================================================== */
+
+const cv = document.getElementById("game"), ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+let state = "start", ship, objs, parts, rings, floats, score, lives, level, streak, mult, effect, invuln, spawnT, best = 0, shake = 0, t = 0;
+const keys = {}; let mouseX = null;
+
+/* ---------- Audio: ambient drone + effects, all generated in code ---------- */
+let actx, ambient = false;
+function ac() { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); return actx; }
+function startAmbient() {
+  if (ambient) return; ambient = true;
+  try {
+    const a = ac(), g = a.createGain(); g.gain.value = 0.035; g.connect(a.destination);
+    [55, 82.5, 110.4].forEach(f => { const o = a.createOscillator(); o.type = "sine"; o.frequency.value = f; o.connect(g); o.start(); });
+  } catch (e) {}
+}
+function beep(f, d, type = "sine", v = 0.1, slide = 0) {
+  try {
+    const a = ac(), o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, a.currentTime);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f + slide), a.currentTime + d);
+    g.gain.value = v; g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + d);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + d);
+  } catch (e) {}
+}
+const sfx = {
+  crystal: m => beep(600 + m * 120, .25, "triangle", .12, 500),
+  hit: () => beep(160, .5, "sawtooth", .22, -120),
+  power: () => [500, 700, 1000, 1400].forEach((f, i) => setTimeout(() => beep(f, .2, "sine", .1), i * 70)),
+  over: () => beep(300, 1.2, "sawtooth", .15, -250)
+};
+
+/* ---------- Background layers ---------- */
+const stars = [0, 1, 2].flatMap(l => Array.from({ length: 50 + l * 20 }, () => ({ x: Math.random() * W, y: Math.random() * H, l, tw: Math.random() * 6 })));
+const nebulae = [{ x: 200, y: 150, r: 320, c: "110,40,255" }, { x: 700, y: 400, r: 360, c: "0,170,255" }, { x: 450, y: 560, r: 300, c: "255,40,150" }];
+
+/* ---------- Game setup ---------- */
+function resetGame() {
+  ship = { x: W / 2, y: H - 90, vx: 0, vy: 0, r: 13 };
+  objs = []; parts = []; rings = []; floats = [];
+  score = 0; lives = CONFIG.startLives; level = 1; streak = 0; mult = 1; effect = 0; invuln = 0; spawnT = 0;
+}
+function startGame() { startAmbient(); resetGame(); state = "playing"; }
+function speedFactor() { return (1 + (level - 1) * CONFIG.speedPerLevel) * (effect > 0 && CONFIG.specialType === "slowmo" ? 0.45 : 1); }
+function spawn() {
+  const r = Math.random(), hz = Math.min(0.6, 0.3 + (level - 1) * CONFIG.hazardPerLevel);
+  const type = r < 0.05 ? "power" : r < 0.05 + hz ? "rock" : "crystal";
+  const o = { type, x: 30 + Math.random() * (W - 60), y: -40, vy: 1.8 + Math.random() * 1.6, vx: (Math.random() - .5) * 0.8, rot: 0, vr: (Math.random() - .5) * 0.06, r: type === "rock" ? 20 + Math.random() * 16 : 13 };
+  if (type === "rock") o.pts = Array.from({ length: 9 }, (_, i) => { const a = i / 9 * 6.283; const k = 0.75 + Math.random() * 0.35; return [Math.cos(a) * o.r * k, Math.sin(a) * o.r * k]; });
+  objs.push(o);
+}
+
+/* ---------- Effects ---------- */
+function burst(x, y, color, n, speed = 4) {
+  for (let i = 0; i < n; i++) { const a = Math.random() * 6.283, s = Math.random() * speed; parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 30 + Math.random() * 30, max: 60, c: color, s: 1 + Math.random() * 2.5 }); }
+}
+function ring(x, y, color) { rings.push({ x, y, r: 6, c: color, life: 28 }); }
+function pop(txt, x, y, c) { floats.push({ txt, x, y, c, life: 50 }); }
+
+/* ---------- Update ---------- */
+function update() {
+  t++;
+  stars.forEach(s => { s.y += (0.3 + s.l * 0.6) * (state === "playing" ? speedFactor() : 1); if (s.y > H) { s.y = 0; s.x = Math.random() * W; } });
+  parts.forEach(p => { p.x += p.vx; p.y += p.vy; p.vx *= 0.97; p.vy *= 0.97; p.life--; }); parts = parts.filter(p => p.life > 0);
+  rings.forEach(r => { r.r += 3.2; r.life--; }); rings = rings.filter(r => r.life > 0);
+  floats.forEach(f => { f.y -= 0.8; f.life--; }); floats = floats.filter(f => f.life > 0);
+  if (shake > 0) shake--;
+  if (state !== "playing") return;
+
+  // Ship: keyboard accelerates, mouse eases toward the pointer
+  const ax = (keys["ArrowRight"] || keys["d"] ? 1 : 0) - (keys["ArrowLeft"] || keys["a"] ? 1 : 0);
+  const ay = (keys["ArrowDown"] || keys["s"] ? 1 : 0) - (keys["ArrowUp"] || keys["w"] ? 1 : 0);
+  ship.vx += ax * 0.9; ship.vy += ay * 0.9;
+  if (mouseX !== null && !ax) ship.vx += (mouseX - ship.x) * 0.02;
+  ship.vx *= 0.82; ship.vy *= 0.82;
+  ship.x = Math.max(20, Math.min(W - 20, ship.x + ship.vx));
+  ship.y = Math.max(H * 0.45, Math.min(H - 30, ship.y + ship.vy));
+  parts.push({ x: ship.x + (Math.random() - .5) * 6, y: ship.y + 16, vx: (Math.random() - .5) * 0.6, vy: 2 + Math.random() * 2, life: 18, max: 18, c: "#ff9d3d", s: 2.5 });   // engine trail
+
+  if (effect > 0) effect -= 1 / 60; if (invuln > 0) invuln -= 1 / 60;
+  spawnT--; if (spawnT <= 0) { spawn(); spawnT = Math.max(14, 44 - level * 3); }
+
+  const sf = speedFactor();
+  objs = objs.filter(o => {
+    if (o.type === "crystal" && effect > 0 && CONFIG.specialType === "magnet") {      // magnet pulls crystals in
+      const dx = ship.x - o.x, dy = ship.y - o.y, d = Math.hypot(dx, dy);
+      if (d < 260) { o.x += dx / d * 4.5; o.y += dy / d * 4.5; }
+    }
+    o.y += o.vy * sf; o.x += o.vx * sf; o.rot += o.vr;
+    if (Math.hypot(o.x - ship.x, o.y - ship.y) < o.r + ship.r) {      // circle-circle collision
+      if (o.type === "crystal") {
+        streak++; mult = Math.min(CONFIG.maxMultiplier, 1 + Math.floor(streak / 5));
+        const pts = CONFIG.crystalPoints * mult; score += pts; sfx.crystal(mult);
+        burst(o.x, o.y, "#7dffe9", 22); ring(o.x, o.y, "#7dffe9"); pop("+" + pts, o.x, o.y, "#7dffe9");
+      } else if (o.type === "power") {
+        effect = CONFIG.specialDuration; sfx.power(); burst(o.x, o.y, "#ffd84d", 40, 6); ring(o.x, o.y, "#ffd84d"); pop(CONFIG.specialType.toUpperCase() + "!", o.x, o.y, "#ffd84d");
+      } else if (invuln <= 0) {
+        if (effect > 0 && CONFIG.specialType === "shield") { burst(o.x, o.y, "#59f3ff", 30); ring(o.x, o.y, "#59f3ff"); }
+        else { lives--; streak = 0; mult = 1; score = Math.max(0, score - CONFIG.hitPenalty); invuln = 1.8; shake = 18; sfx.hit(); burst(o.x, o.y, "#ff5a5a", 50, 7); ring(o.x, o.y, "#ff5a5a"); pop("-" + CONFIG.hitPenalty, ship.x, ship.y - 20, "#ff5a5a"); }
+      } else return true;
+      return false;
+    }
+    if (o.y > H + 50) { if (o.type === "crystal") { streak = 0; mult = 1; } return false; }
+    return true;
+  });
+
+  level = 1 + Math.floor(score / CONFIG.levelEvery);
+  if (lives <= 0) { state = "gameover"; best = Math.max(best, score); sfx.over(); burst(ship.x, ship.y, "#59f3ff", 80, 8); }
+}
+
+/* ---------- Drawing ---------- */
+function txt(s, x, y, size, c = "#fff", al = "center", glow = 12) {
+  ctx.save(); ctx.fillStyle = c; ctx.shadowColor = c; ctx.shadowBlur = glow; ctx.font = "bold " + size + "px 'Trebuchet MS', sans-serif"; ctx.textAlign = al; ctx.fillText(s, x, y); ctx.restore();
+}
+function drawBG() {
+  ctx.fillStyle = "#04030f"; ctx.fillRect(0, 0, W, H);
+  nebulae.forEach((n, i) => {
+    const ox = Math.sin(t / 400 + i * 2) * 40, oy = Math.cos(t / 500 + i) * 30;
+    const g = ctx.createRadialGradient(n.x + ox, n.y + oy, 0, n.x + ox, n.y + oy, n.r);
+    g.addColorStop(0, `rgba(${n.c},.30)`); g.addColorStop(1, `rgba(${n.c},0)`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  });
+  stars.forEach(s => {
+    ctx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(t / 30 + s.tw)); ctx.fillStyle = s.l === 2 ? "#cfe8ff" : "#8a8fd8";
+    const z = 1 + s.l * 0.7; ctx.fillRect(s.x, s.y, z, z + (state === "playing" ? s.l : 0));
+  });
+  ctx.globalAlpha = 1;
+}
+function drawShip() {
+  if (invuln > 0 && Math.floor(t / 4) % 2) return;
+  ctx.save(); ctx.translate(ship.x, ship.y);
+  ctx.rotate(ship.vx * 0.03);
+  ctx.shadowColor = CONFIG.shipColor; ctx.shadowBlur = 25;
+  ctx.fillStyle = CONFIG.shipColor; ctx.beginPath(); ctx.moveTo(0, -20); ctx.lineTo(14, 14); ctx.lineTo(0, 7); ctx.lineTo(-14, 14); ctx.closePath(); ctx.fill();
+  ctx.shadowBlur = 0; ctx.fillStyle = "#0a1230"; ctx.beginPath(); ctx.moveTo(0, -9); ctx.lineTo(5, 5); ctx.lineTo(-5, 5); ctx.closePath(); ctx.fill();
+  ctx.restore();
+  if (effect > 0 && CONFIG.specialType === "shield") { ctx.strokeStyle = "rgba(89,243,255," + (0.5 + 0.3 * Math.sin(t / 5)) + ")"; ctx.lineWidth = 3; ctx.shadowColor = "#59f3ff"; ctx.shadowBlur = 20; ctx.beginPath(); ctx.arc(ship.x, ship.y, 28, 0, 7); ctx.stroke(); ctx.shadowBlur = 0; }
+  if (effect > 0 && CONFIG.specialType === "magnet") { ctx.strokeStyle = "rgba(255,216,77,.25)"; ctx.setLineDash([6, 8]); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(ship.x, ship.y, 260, 0, 7); ctx.stroke(); ctx.setLineDash([]); }
+}
+function drawObj(o) {
+  ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.rot);
+  if (o.type === "rock") {
+    ctx.shadowColor = "#ff5a5a"; ctx.shadowBlur = 14; ctx.fillStyle = "#2a2230"; ctx.strokeStyle = "#ff6a5a"; ctx.lineWidth = 2;
+    ctx.beginPath(); o.pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0; ctx.fillStyle = "#1a1420"; ctx.beginPath(); ctx.arc(o.r * .25, -o.r * .2, o.r * .22, 0, 7); ctx.fill(); ctx.beginPath(); ctx.arc(-o.r * .3, o.r * .25, o.r * .15, 0, 7); ctx.fill();
+  } else {
+    const col = o.type === "crystal" ? "#7dffe9" : "#ffd84d", r = o.r * (1 + 0.1 * Math.sin(t / 8));
+    ctx.shadowColor = col; ctx.shadowBlur = 24; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.moveTo(0, -r * 1.4); ctx.lineTo(r, 0); ctx.lineTo(0, r * 1.4); ctx.lineTo(-r, 0); ctx.closePath(); ctx.fill();
+    ctx.shadowBlur = 0; ctx.fillStyle = "rgba(255,255,255,.7)"; ctx.beginPath(); ctx.moveTo(0, -r * 1.4); ctx.lineTo(r * .35, 0); ctx.lineTo(0, r * .3); ctx.lineTo(-r * .35, 0); ctx.closePath(); ctx.fill();
+    if (o.type === "power") { ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(0, 0, r * 2, 0, 7); ctx.stroke(); }
+  }
+  ctx.restore();
+}
+function drawFX() {
+  ctx.globalCompositeOperation = "lighter";                      // additive blending = glow
+  parts.forEach(p => { ctx.globalAlpha = Math.max(0, p.life / p.max); ctx.fillStyle = p.c; ctx.beginPath(); ctx.arc(p.x, p.y, p.s, 0, 7); ctx.fill(); });
+  rings.forEach(r => { ctx.globalAlpha = r.life / 28; ctx.strokeStyle = r.c; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, 7); ctx.stroke(); });
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+  floats.forEach(f => { ctx.globalAlpha = f.life / 50; txt(f.txt, f.x, f.y, 22, f.c); }); ctx.globalAlpha = 1;
+}
+function drawHUD() {
+  txt("SCORE " + score, 20, 36, 24, "#fff", "left");
+  txt("LEVEL " + level, W / 2, 36, 24, "#b49bff");
+  txt("♥".repeat(Math.max(0, lives)), W - 20, 38, 26, "#ff5a8a", "right");
+  if (mult > 1) txt("x" + mult + " COMBO", 20, 66, 20, "#7dffe9", "left");
+  if (effect > 0) {                                                // power-up timer bar
+    ctx.fillStyle = "rgba(255,216,77,.2)"; ctx.fillRect(W / 2 - 100, 52, 200, 8);
+    ctx.fillStyle = "#ffd84d"; ctx.fillRect(W / 2 - 100, 52, 200 * effect / CONFIG.specialDuration, 8);
+    txt(CONFIG.specialType.toUpperCase(), W / 2, 78, 14, "#ffd84d", "center", 6);
+  }
+}
+function dim() { ctx.fillStyle = "rgba(2,2,10,.7)"; ctx.fillRect(0, 0, W, H); }
+function draw() {
+  ctx.save(); if (shake > 0) ctx.translate((Math.random() - .5) * shake * .6, (Math.random() - .5) * shake * .6);
+  drawBG();
+  if (state !== "start") { objs.forEach(drawObj); if (state !== "gameover") drawShip(); }
+  drawFX(); ctx.restore();
+  const v = ctx.createRadialGradient(W / 2, H / 2, H * 0.4, W / 2, H / 2, H * 0.9);      // vignette
+  v.addColorStop(0, "rgba(0,0,0,0)"); v.addColorStop(1, "rgba(0,0,0,.65)"); ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  if (state === "start") {
+    dim(); txt(CONFIG.title, W / 2, 190, 68, "#59f3ff", "center", 30);
+    txt("Drift through the nebula. Collect crystals. Dodge the rocks.", W / 2, 240, 20, "#cfd6ff", "center", 6);
+    txt("◆ crystal  +" + CONFIG.crystalPoints + "  (5 in a row raises your combo)", W / 2, 300, 20, "#7dffe9", "center", 8);
+    txt("● rock  −1 life, −" + CONFIG.hitPenalty + " points", W / 2, 332, 20, "#ff7a6a", "center", 8);
+    txt("◆ golden  " + CONFIG.specialType.toUpperCase() + " power-up", W / 2, 364, 20, "#ffd84d", "center", 8);
+    txt("Move: arrows / WASD or mouse     Pause: P", W / 2, 420, 18, "#cfd6ff", "center", 4);
+    txt("Press ENTER or click to launch", W / 2, 490, 28, "#fff", "center", 16);
+    if (best) txt("Best: " + best, W / 2, 530, 20, "#ffd84d");
+  } else drawHUD();
+  if (state === "paused") { dim(); txt("PAUSED", W / 2, H / 2, 56); txt("Press P to resume", W / 2, H / 2 + 40, 20, "#cfd6ff"); }
+  if (state === "gameover") {
+    dim(); txt("SIGNAL LOST", W / 2, 210, 62, "#ff5a8a", "center", 28);
+    txt("Score " + score + "    Level " + level, W / 2, 275, 30);
+    txt("Best " + best, W / 2, 318, 22, "#ffd84d");
+    txt("Press ENTER or click to fly again", W / 2, 400, 24, "#fff", "center", 14);
+  }
+}
+
+/* ---------- Input ---------- */
+addEventListener("keydown", e => {
+  keys[e.key] = true;
+  if (e.key === "Enter" && (state === "start" || state === "gameover")) startGame();
+  if ((e.key === "p" || e.key === "P") && (state === "playing" || state === "paused")) state = state === "playing" ? "paused" : "playing";
+  if (e.key.startsWith("Arrow")) e.preventDefault();
+});
+addEventListener("keyup", e => keys[e.key] = false);
+cv.addEventListener("mousemove", e => { const r = cv.getBoundingClientRect(); mouseX = (e.clientX - r.left) * (W / r.width); });
+cv.addEventListener("touchmove", e => { const r = cv.getBoundingClientRect(); mouseX = (e.touches[0].clientX - r.left) * (W / r.width); }, { passive: true });
+cv.addEventListener("click", () => { if (state === "start" || state === "gameover") startGame(); });
+
+/* ---------- Main loop ---------- */
+resetGame();
+(function loop() { update(); draw(); requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
